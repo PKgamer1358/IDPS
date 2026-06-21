@@ -59,7 +59,7 @@ def edge_density(pixels_2d):
 
 def predict_rf(img_array: np.ndarray) -> float:
     # Convert numpy image array to grayscale (L)
-    img = Image.fromarray(img_array).convert("L")
+    img = Image.fromarray(img_array.astype(np.uint8)).convert("L")
     pixels_2d = np.array(img)
     pixels = pixels_2d.flatten()
 

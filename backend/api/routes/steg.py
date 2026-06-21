@@ -474,7 +474,7 @@ async def analyze_image(
         "source_ip": source_ip,
         "media_type": "image",
         "confidence": report["final_confidence"],
-        "algorithm_detected": "Hybrid CNN + Statistical",
+        "algorithm_detected": "Hybrid RF + Statistical",
         "payload_estimate": None,
         "forensic_json": forensic_json
     }
@@ -509,4 +509,5 @@ async def analyze_image(
         }
     )
 
+    report["hidden_message"] = report.get("hidden_message")
     return report
