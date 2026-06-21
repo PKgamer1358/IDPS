@@ -6,6 +6,7 @@ import numpy as np
 
 from backend.services.steg.rf_classifier import predict_rf
 from backend.services.steg.algorithms import analyze_image
+from backend.services.steg.extractor import extractor
 
 
 class StegDetector:
@@ -26,10 +27,7 @@ class StegDetector:
         statistical_score = stats["confidence"]
 
         # Compute final confidence
-        final_confidence = (
-            0.6 * rf_score +
-            0.4 * statistical_score
-        )
+        final_confidence = max(rf_score, statistical_score)
 
         # Debugging logs
         print("RF SCORE =", rf_score)
@@ -53,7 +51,7 @@ class StegDetector:
             "statistical_score": round(statistical_score, 4),
             "final_confidence": round(final_confidence, 4),
             "verdict": verdict,
-            "hidden_message": None
+            "hidden_message": extractor.extract(image_bytes)
         }
 
 
