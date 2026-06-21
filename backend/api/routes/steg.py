@@ -1,0 +1,512 @@
+import json
+from uuid import uuid4
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, BackgroundTasks
+from sqlalchemy.orm import Session
+from typing import Optional
+import os
+import shutil
+import tempfile
+
+from backend.db.database import get_db, SessionLocal
+from backend.db import models
+from backend.schemas.base import StegEventCreate, IncidentResponse
+from backend.services.response.alert_bus import alert_bus, TOPIC_STEG_DETECTION
+from backend.api.websocket.ws_manager import ws_manager
+from backend.services.correlation import assign_correlation
+from backend.services.response.blocker import block_ip
+from backend.utils.helpers import compute_severity
+from backend.db.repositories.incidents_repository import IncidentsRepository
+from backend.services.video.processing.pipeline import VideoAnalysisPipeline
+from backend.services.video.integration.analyzer_client import InternalAnalyzerClient
+from backend.core.logging import get_logger
+from backend.services.steg.detector import detector
+
+logger = get_logger("shieldnet.api.steg")
+
+router = APIRouter(prefix="/steg", tags=["Steganalysis"])
+
+
+@router.post("/event", response_model=IncidentResponse)
+async def create_steg_event(payload: StegEventCreate, db: Session = Depends(get_db)):
+    severity = compute_severity(payload.confidence)
+    media_label = payload.media_type.upper()
+    explanation = (
+        f"{media_label} steganographic covert channel detected. "
+        f"Algorithm: {payload.algorithm_detected or 'Unknown'}. "
+        f"Confidence: {payload.confidence:.0%}. "
+        f"Estimated hidden payload: {payload.payload_estimate or '?'} bytes."
+    )
+
+    incident_data = {
+        "incident_uid": str(uuid4()),
+        "timestamp": datetime.utcnow(),
+        "source_ip": payload.source_ip,
+        "pipeline": "B",
+        "pipeline_primary": "steg",
+        "attack_type": f"{payload.media_type}_steg_detected",
+        "media_type": payload.media_type,
+        "confidence": payload.confidence,
+        "severity": severity,
+        "explanation": explanation,
+        "detected_at": datetime.utcnow(),
+    }
+    incident = IncidentsRepository.create_incident(db, incident_data)
+
+    forensic_json = json.dumps(payload.forensic_data) if payload.forensic_data else None
+    scan_data = {
+        "incident_id": incident.id,
+        "filename": payload.filename,
+        "file_size": payload.file_size,
+        "source_ip": payload.source_ip,
+        "media_type": payload.media_type,
+        "confidence": payload.confidence,
+        "algorithm_detected": payload.algorithm_detected,
+        "payload_estimate": payload.payload_estimate,
+        "frame_count": payload.frame_count,
+        "forensic_json": forensic_json,
+    }
+    scan = IncidentsRepository.add_steg_scan(db, scan_data)
+
+    if payload.frame_results:
+        for fr in payload.frame_results:
+            # Handle if fr is a Pydantic model
+            fr_dict = fr.dict() if hasattr(fr, 'dict') else fr
+            IncidentsRepository.add_video_frame_result(db, {
+                "steg_scan_id": scan.id,
+                "frame_number": fr_dict.get("frame_idx", 0) if "frame_idx" in fr_dict else fr_dict.get("frame_number", 0),
+                "timestamp_ms": fr_dict.get("timestamp_ms"),
+                "confidence": fr_dict.get("confidence", 0.0),
+                "chi_square": fr_dict.get("chi_square"),
+                "rs_score": fr_dict.get("rs_score"),
+                "dct_score": fr_dict.get("dct_score"),
+                "anomaly_type": fr_dict.get("anomaly_type") or fr_dict.get("algorithm_detected"),
+            })
+
+    if payload.audio_results:
+        for ar in payload.audio_results:
+            ar_dict = ar.dict() if hasattr(ar, 'dict') else ar
+            IncidentsRepository.add_audio_scan_result(db, {
+                "steg_scan_id": scan.id,
+                "channel": ar_dict.get("channel"),
+                "rs_score": ar_dict.get("rs_score"),
+                "echo_score": ar_dict.get("echo_score"),
+                "confidence": ar_dict.get("confidence", 0.0),
+                "sample_range_flagged": ar_dict.get("sample_range_flagged"),
+            })
+
+    assign_correlation(db, incident)
+
+    if severity in ("high", "critical"):
+        block_ip(db, payload.source_ip, "steg", "Auto-block: steg covert channel")
+        incident.blocked = True
+
+    db.commit()
+    db.refresh(incident)
+
+    await ws_manager.broadcast({
+        "event_type": "new_incident",
+        "pipeline_badge": f"{media_label}-STEG",
+        "incident": {
+            "id": incident.id,
+            "uid": incident.incident_uid,
+            "source_ip": incident.source_ip,
+            "attack_type": incident.attack_type,
+            "media_type": incident.media_type,
+            "confidence": incident.confidence,
+            "severity": incident.severity,
+            "explanation": incident.explanation,
+            "correlation_group_id": incident.correlation_group_id,
+            "timestamp": incident.detected_at.isoformat(),
+        }
+    })
+
+    await alert_bus.publish(TOPIC_STEG_DETECTION, {
+        "source_ip": payload.source_ip,
+        "media_type": payload.media_type,
+        "confidence": payload.confidence,
+        "severity": severity,
+    })
+    return incident
+
+
+@router.post("/upload/video")
+async def upload_video(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    source_ip: str = "127.0.0.1",
+    db: Session = Depends(get_db)
+):
+    if not file.content_type.startswith("video/"):
+        raise HTTPException(status_code=400, detail="Only video files are supported")
+
+    # Save to a temporary file
+    with tempfile.NamedTemporaryFile(suffix=os.path.splitext(file.filename)[1], delete=False) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = tmp.name
+
+    logger.info(f"Received video upload: {file.filename} ({tmp_path})")
+
+    # Start async processing
+    background_tasks.add_task(
+        process_video_task,
+        tmp_path,
+        file.filename,
+        source_ip
+    )
+
+    return {
+        "status": "processing",
+        "filename": file.filename,
+        "message": "Video analysis started in background"
+    }
+
+
+async def process_video_task(video_path: str, filename: str, source_ip: str):
+    """Background task for full video analysis with real-time updates."""
+    analysis_id = str(uuid4())
+    try:
+        # Progress callback for the pipeline
+        async def on_progress(data: dict):
+            await ws_manager.broadcast({
+                "event_type": "video_progress",
+                "analysis_id": analysis_id,
+                "filename": filename,
+                "progress": data["progress"],
+                "frames_processed": data["frames_processed"],
+                "current_confidence": data["current_confidence"]
+            })
+
+        client = InternalAnalyzerClient()
+        pipeline = VideoAnalysisPipeline(analyzer=client)
+        result = await pipeline.process_video(video_path, on_progress=on_progress)
+        
+        with SessionLocal() as db:
+            # Prepare payload for reporting
+            from backend.schemas.base import StegEventCreate
+            payload = StegEventCreate(
+                source_ip=source_ip,
+                media_type="video",
+                confidence=result["confidence"],
+                filename=filename,
+                file_size=os.path.getsize(video_path),
+                algorithm_detected=result.get("algorithm_detected"),
+                payload_estimate=0, # Placeholder
+                frame_count=result.get("frame_count"),
+                forensic_data={
+                    "max_frame_confidence": result.get("max_frame_confidence"),
+                    "suspicious_frame_density": result.get("suspicious_frame_density"),
+                    "processing_duration": result.get("processing_duration"),
+                },
+                frame_results=[{
+                    "frame_number": fr.get("frame_idx"),
+                    "timestamp_ms": fr.get("timestamp_ms"),
+                    "confidence": fr.get("confidence"),
+                    "anomaly_type": fr.get("algorithm_detected")
+                } for fr in result.get("frame_results", [])],
+                audio_results=[]
+            )
+            
+            await _handle_steg_report(payload, db)
+
+    except Exception as e:
+        logger.error(f"Background video analysis failed: {e}")
+    finally:
+        if os.path.exists(video_path):
+            os.unlink(video_path)
+
+
+async def _handle_steg_report(payload: StegEventCreate, db: Session):
+    severity = compute_severity(payload.confidence)
+    media_label = payload.media_type.upper()
+    explanation = (
+        f"{media_label} steganographic covert channel detected via Async Pipeline. "
+        f"Algorithm: {payload.algorithm_detected or 'Unknown'}. "
+        f"Confidence: {payload.confidence:.0%}. "
+    )
+
+    incident_data = {
+        "incident_uid": str(uuid4()),
+        "timestamp": datetime.utcnow(),
+        "source_ip": payload.source_ip,
+        "pipeline": "B",
+        "pipeline_primary": "steg",
+        "attack_type": f"{payload.media_type}_steg_detected",
+        "media_type": payload.media_type,
+        "confidence": payload.confidence,
+        "severity": severity,
+        "explanation": explanation,
+        "detected_at": datetime.utcnow(),
+    }
+    incident = IncidentsRepository.create_incident(db, incident_data)
+
+    forensic_json = json.dumps(payload.forensic_data) if payload.forensic_data else None
+    scan_data = {
+        "incident_id": incident.id,
+        "filename": payload.filename,
+        "file_size": payload.file_size,
+        "source_ip": payload.source_ip,
+        "media_type": payload.media_type,
+        "confidence": payload.confidence,
+        "algorithm_detected": payload.algorithm_detected,
+        "payload_estimate": payload.payload_estimate,
+        "frame_count": payload.frame_count,
+        "forensic_json": forensic_json,
+    }
+    scan = IncidentsRepository.add_steg_scan(db, scan_data)
+
+    for fr in payload.frame_results:
+        fr_dict = fr.dict() if hasattr(fr, 'dict') else fr
+        IncidentsRepository.add_video_frame_result(db, {
+            "steg_scan_id": scan.id,
+            "frame_number": fr_dict.get("frame_idx", 0) if "frame_idx" in fr_dict else fr_dict.get("frame_number", 0),
+            "timestamp_ms": fr_dict.get("timestamp_ms"),
+            "confidence": fr_dict.get("confidence", 0.0),
+            "anomaly_type": fr_dict.get("anomaly_type") or fr_dict.get("algorithm_detected"),
+        })
+
+    assign_correlation(db, incident)
+    if severity in ("high", "critical"):
+        block_ip(db, payload.source_ip, "steg", "Auto-block: steg covert channel")
+        incident.blocked = True
+
+    db.commit()
+    
+    await ws_manager.broadcast({
+        "event_type": "new_incident",
+        "pipeline_badge": f"{media_label}-STEG",
+        "incident": {
+            "id": incident.id,
+            "uid": incident.incident_uid,
+            "source_ip": incident.source_ip,
+            "attack_type": incident.attack_type,
+            "media_type": incident.media_type,
+            "confidence": incident.confidence,
+            "severity": incident.severity,
+            "explanation": incident.explanation,
+            "correlation_group_id": incident.correlation_group_id,
+            "timestamp": incident.detected_at.isoformat(),
+        }
+    })
+    
+    await alert_bus.publish(TOPIC_STEG_DETECTION, {
+        "source_ip": payload.source_ip,
+        "media_type": payload.media_type,
+        "confidence": payload.confidence,
+        "severity": severity,
+    })
+
+
+@router.get("/video/feed")
+def get_video_feed(limit: int = 50, db: Session = Depends(get_db)):
+    """Last N video steg scans for Panel 5."""
+    scans = (
+        db.query(models.StegScan)
+        .filter(models.StegScan.media_type == "video")
+        .order_by(models.StegScan.id.desc())
+        .limit(limit)
+        .all()
+    )
+    results = []
+    for s in scans:
+        incident = db.query(models.Incident).filter(models.Incident.id == s.incident_id).first()
+        flagged_frames = (
+            db.query(models.VideoFrameResult)
+            .filter(models.VideoFrameResult.steg_scan_id == s.id,
+                    models.VideoFrameResult.confidence >= 0.4)
+            .count()
+        )
+        audio = (
+            db.query(models.AudioScanResult)
+            .filter(models.AudioScanResult.steg_scan_id == s.id)
+            .first()
+        )
+        results.append({
+            "id": s.id,
+            "incident_id": s.incident_id,
+            "filename": s.filename,
+            "file_size": s.file_size,
+            "confidence": s.confidence,
+            "severity": incident.severity if incident else "low",
+            "frame_count": s.frame_count or 0,
+            "flagged_frames_count": flagged_frames,
+            "audio_flagged": bool(audio and audio.confidence >= 0.4),
+            "quarantine_path": s.quarantine_path,
+            "timestamp": incident.detected_at.isoformat() if incident else None,
+            "algorithm_detected": s.algorithm_detected,
+        })
+    return results
+
+
+@router.get("/quarantine")
+def get_quarantine(db: Session = Depends(get_db)):
+    """List all quarantined files (steg scans with a quarantine_path)."""
+    scans = (
+        db.query(models.StegScan)
+        .filter(models.StegScan.quarantine_path.isnot(None))
+        .order_by(models.StegScan.id.desc())
+        .limit(100)
+        .all()
+    )
+    return [
+        {
+            "id": s.id,
+            "filename": s.filename,
+            "media_type": s.media_type,
+            "confidence": s.confidence,
+            "quarantine_path": s.quarantine_path,
+            "payload_estimate": s.payload_estimate,
+        }
+        for s in scans
+    ]
+
+
+@router.get("/health")
+def steg_health():
+    """Returns mock mode status and CNN load status for Panel 9 warning."""
+    from backend.services.steg.cnn.cnn_classifier import _MODEL_LOADED
+    try:
+        from backend.services.steg.algorithms import (
+            chi_square_analysis, rs_analysis, sample_pair_analysis
+        )
+        algorithms_available = [
+            "chi_square", "sample_pair", "rs_analysis",
+            "dct_histogram", "pixel_histogram", "noise_residual", "benford_law"
+        ]
+    except ImportError:
+        algorithms_available = []
+    try:
+        from PIL import Image
+        pil_available = True
+    except ImportError:
+        pil_available = False
+    mock_mode = not pil_available
+    return {
+        "mock_mode": mock_mode,
+        "cnn_loaded": _MODEL_LOADED,
+        "algorithms_available": algorithms_available,
+        "pil_available": pil_available,
+        "warning": "Running in MOCK MODE — install Pillow for real analysis" if mock_mode else None,
+    }
+
+
+@router.get("/forensics/{incident_id}")
+def get_forensics(incident_id: int, db: Session = Depends(get_db)):
+    inc = IncidentsRepository.get_incident_by_id(db, incident_id)
+    if not inc:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    scan = IncidentsRepository.get_steg_scan_by_incident(db, incident_id)
+    if not scan:
+        raise HTTPException(status_code=404, detail="No forensic data for this incident")
+
+    frames = IncidentsRepository.get_video_frames_by_scan(db, scan.id)
+    audio = IncidentsRepository.get_audio_results_by_scan(db, scan.id)
+
+    return {
+        "incident_id": incident_id,
+        "incident_uid": inc.incident_uid,
+        "source_ip": inc.source_ip,
+        "media_type": scan.media_type,
+        "filename": scan.filename,
+        "file_size": scan.file_size,
+        "confidence": scan.confidence,
+        "algorithm_detected": scan.algorithm_detected,
+        "payload_estimate_bytes": scan.payload_estimate,
+        "frame_count": scan.frame_count,
+        "forensic_data": json.loads(scan.forensic_json) if scan.forensic_json else {},
+        "quarantine_path": scan.quarantine_path,
+        "frame_results": [{"frame_number": f.frame_number, "timestamp_ms": f.timestamp_ms, "confidence": f.confidence, "chi_square": f.chi_square, "rs_score": f.rs_score, "dct_score": f.dct_score, "anomaly_type": f.anomaly_type} for f in frames],
+        "audio_results": [{"channel": a.channel, "rs_score": a.rs_score, "echo_score": a.echo_score, "confidence": a.confidence, "sample_range_flagged": a.sample_range_flagged} for a in audio],
+    }
+
+@router.post("/analyze")
+async def analyze_image(
+    file: UploadFile = File(...),
+    source_ip: str = "127.0.0.1",
+    db: Session = Depends(get_db)
+):
+
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only image files supported"
+        )
+
+    image_bytes = await file.read()
+
+    report = detector.analyze(image_bytes)
+
+    severity = compute_severity(
+        report["final_confidence"]
+    )
+
+    explanation = (
+        f"Image steganography analysis completed. "
+        f"Verdict: {report['verdict']} "
+        f"Confidence: {report['final_confidence']:.2%}"
+    )
+
+    incident_data = {
+        "incident_uid": str(uuid4()),
+        "timestamp": datetime.utcnow(),
+        "source_ip": source_ip,
+        "pipeline": "B",
+        "pipeline_primary": "steg",
+        "attack_type": "image_steg_analysis",
+        "media_type": "image",
+        "confidence": report["final_confidence"],
+        "severity": severity,
+        "explanation": explanation,
+        "detected_at": datetime.utcnow()
+    }
+
+    incident = IncidentsRepository.create_incident(
+        db,
+        incident_data
+    )
+
+    forensic_json = json.dumps(report)
+
+    scan_data = {
+        "incident_id": incident.id,
+        "filename": file.filename,
+        "file_size": len(image_bytes),
+        "source_ip": source_ip,
+        "media_type": "image",
+        "confidence": report["final_confidence"],
+        "algorithm_detected": "Hybrid CNN + Statistical",
+        "payload_estimate": None,
+        "forensic_json": forensic_json
+    }
+
+    IncidentsRepository.add_steg_scan(
+        db,
+        scan_data
+    )
+
+    db.commit()
+
+    await ws_manager.broadcast({
+        "event_type": "steg_analysis",
+        "pipeline_badge": "IMAGE-STEG",
+        "incident": {
+            "source_ip": source_ip,
+            "filename": file.filename,
+            "confidence": report["final_confidence"],
+            "severity": severity,
+            "verdict": report["verdict"],
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    })
+
+    await alert_bus.publish(
+        TOPIC_STEG_DETECTION,
+        {
+            "source_ip": source_ip,
+            "confidence": report["final_confidence"],
+            "severity": severity,
+            "media_type": "image"
+        }
+    )
+
+    return report
